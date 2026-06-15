@@ -348,19 +348,19 @@ func (c *Catalog) WaitForPlan(
 
 Suggested behavior:
 
-| User mode | Catalog capability | Table config | Behavior |
-| --- | --- | --- | --- |
-| default | any | absent / `client` | local planning |
-| default | supported | `server` | remote planning |
-| default | unsupported | `server` | error: server requires remote, client cannot |
-| local (explicit) | any | absent / `client` | local planning |
-| local (explicit) | any | `server` | error: user forced local, server requires remote |
-| remote | unsupported | any | error |
-| remote | supported | `client` | error |
-| remote | supported | absent / `server` | remote planning |
-| auto | unsupported | any | local planning |
-| auto | supported | `client` | local planning |
-| auto | supported | `server` / absent | remote planning |
+| User mode        | Catalog capability | Table config      | Behavior                                         |
+| ---------------- | ------------------ | ----------------- | ------------------------------------------------ |
+| default          | any                | absent / `client` | local planning                                   |
+| default          | supported          | `server`          | remote planning                                  |
+| default          | unsupported        | `server`          | error: server requires remote, client cannot     |
+| local (explicit) | any                | absent / `client` | local planning                                   |
+| local (explicit) | any                | `server`          | error: user forced local, server requires remote |
+| remote           | unsupported        | any               | error                                            |
+| remote           | supported          | `client`          | error                                            |
+| remote           | supported          | absent / `server` | remote planning                                  |
+| auto             | unsupported        | any               | local planning                                   |
+| auto             | supported          | `client`          | local planning                                   |
+| auto             | supported          | `server` / absent | remote planning                                  |
 
 The table reflects a proposed fail-fast contract for `scan-planning-mode=server`:
 config `server` requires remote planning, and an explicit `ScanPlanningLocal`
@@ -529,7 +529,7 @@ The design must pin, explicitly:
 - Which schema binds a returned `residual-filter`. It must be the schema the
   server planned against — the snapshot's schema, resolved via the snapshot's
   schema-id — not the client's current schema, or field references can bind to
-  the wrong field. This is a *schema* question (schema-id / snapshot) and is
+  the wrong field. This is a _schema_ question (schema-id / snapshot) and is
   independent of partition spec-id below.
 - Which partition spec drives the ordered-partition-array -> field-ID-map decode.
   It must be the spec named by each file's `spec-id`, looked up from table
@@ -650,7 +650,7 @@ only because `PlanFiles` already mutates the receiver during snapshot
 resolution, which is a latent race we should not lean on harder.
 
 The boundary problem is real, but the carrier is an open design choice — and a
-*live* FileIO should not go on `FileScanTask`, which is a serializable data value
+_live_ FileIO should not go on `FileScanTask`, which is a serializable data value
 with a transport codec (`codec/file_scan_task.go`); putting runtime IO state on
 it mixes concerns and breaks task serialization. Options to put to maintainers,
 not a pre-made pick:
@@ -659,7 +659,7 @@ not a pre-made pick:
   IO, returned by a new entry point (largest API change);
 - an internal plan context the `Scan` holds between `PlanFiles` and `ReadTasks`
   (smallest; does not survive a manual two-step across `Scan` instances);
-- a serializable *credential handle* (not a live IO) on `FileScanTask`, resolved
+- a serializable _credential handle_ (not a live IO) on `FileScanTask`, resolved
   to a FileIO at read time (keeps the task serializable, still widens it).
 
 This shapes `FileScanTask` and possibly the codec, so it must be decided before
@@ -952,15 +952,11 @@ later would be painful.
 
 ## Open Questions
 
-Ordered by how much each shapes the public surface. The first three need a
-maintainer call before the planner seam lands; recommendations are given so the
-decision is a reaction, not a design-from-scratch.
-
 1. **Plan-scoped FileIO threading (surface decision).** How does plan-scoped IO
    reach `ReadTasks` across the `PlanFiles` -> `ReadTasks` boundary? Options: a
    `ScanPlan`/planned-result object, an internal plan context on `Scan`, or a
    serializable credential handle on `FileScanTask`. No firm recommendation yet,
-   but a *live* FileIO should not go on `FileScanTask` — it is a data value with
+   but a _live_ FileIO should not go on `FileScanTask` — it is a data value with
    a transport codec. See Scanner Delegation. Must be settled before PR 6.
 
 2. **Capability gating (surface decision).** A single gate is too coarse:
@@ -977,7 +973,7 @@ decision is a reaction, not a design-from-scratch.
    contract.
 
 4. How should `scan-planning-mode=server` be honored? The REST spec says
-   `server` means clients *must* use server-side planning, so silently ignoring
+   `server` means clients _must_ use server-side planning, so silently ignoring
    it likely won't pass review. Proposed contract: config absent/`client` keeps
    the default local; config `server` requires remote planning, and if the client
    cannot or is configured not to (e.g. explicit `ScanPlanningLocal`), it fails
@@ -999,9 +995,9 @@ decision is a reaction, not a design-from-scratch.
    use case, so deferring it drops a stated driver from the first cut — flag this
    to maintainers explicitly rather than letting it be implicit.
 
-## Maintainer Discussion Proposal
+## Discussion Proposal
 
-Before implementing beyond PR 1, ask maintainers to confirm:
+Before implementing beyond PR 1, ask questions to confirm:
 
 - How plan-scoped FileIO reaches `ReadTasks` (Open Question 1) — blocks the seam
   shape; a live IO should not live on `FileScanTask`.
