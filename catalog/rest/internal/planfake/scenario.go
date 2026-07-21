@@ -21,6 +21,7 @@
 package planfake
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -60,6 +61,18 @@ type ResponseSequence struct {
 	RepeatLast bool
 }
 
+// PlanResponder produces a response for POST .../plan from the captured
+// request. It is invoked outside the Server mutex and may be called
+// concurrently, so implementations are responsible for their own
+// synchronization. Implementations must return when ctx ends so request
+// cancellation and Server.Close remain bounded. An error while ctx is live
+// reports a fake scenario failure; errors after cancellation or server close
+// are ignored. A non-2xx Response models a REST server failure.
+//
+// The Request passed to the responder is a defensive copy. A zero Response is
+// an intentional empty 200 response.
+type PlanResponder func(ctx context.Context, request Request) (Response, error)
+
 // ExpectedTarget is the decoded REST planning target accepted by a Scenario.
 // Namespace uses the REST namespace path representation (components joined by
 // the unit separator), while Prefix and Table are decoded path values.
@@ -69,7 +82,8 @@ type ExpectedTarget struct {
 	Table     string
 }
 
-// Scenario declares the responses returned by a Server. ExpectedTarget is
+// Scenario declares the responses returned by a Server. PlanResponse and
+// PlanResponder are mutually exclusive. ExpectedTarget is
 // required for every planning operation; requests for another target, or a
 // planning request made without an expected target, receive a non-retryable
 // scenario error.
@@ -88,6 +102,7 @@ type Scenario struct {
 	ExpectedTarget  *ExpectedTarget
 	ConfigResponse  Response
 	PlanResponse    Response
+	PlanResponder   PlanResponder
 	PollResponses   map[string]ResponseSequence
 	TaskResponses   map[string]ResponseSequence
 	CancelResponses map[string]ResponseSequence
@@ -123,6 +138,7 @@ func cloneScenario(scenario Scenario) Scenario {
 	cloned := Scenario{
 		ConfigResponse: cloneResponse(scenario.ConfigResponse),
 		PlanResponse:   cloneResponse(scenario.PlanResponse),
+		PlanResponder:  scenario.PlanResponder,
 	}
 	if scenario.ExpectedTarget != nil {
 		target := *scenario.ExpectedTarget

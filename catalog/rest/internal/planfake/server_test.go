@@ -21,12 +21,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -484,6 +486,285 @@ func TestServerDefensivelyCopiesScenarioAndHistory(t *testing.T) {
 	requests = srv.Requests()
 	assert.Empty(t, requests[0].Header.Get("X-Changed"))
 	assert.JSONEq(t, `{"snapshot-id":17}`, string(requests[0].Body))
+}
+
+func TestServerDynamicPlanResponderReceivesDefensiveRequestCopy(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		body      string
+		target    ExpectedTarget
+		historyOK bool
+	}
+	observed := make(chan observedRequest, 1)
+
+	var srv *Server
+	srv = New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Prefix: "catalog", Namespace: "db", Table: "events"},
+		PlanResponder: func(_ context.Context, request Request) (Response, error) {
+			history := srv.Requests()
+			got := observedRequest{
+				body: string(request.Body),
+				target: ExpectedTarget{
+					Prefix:    request.Prefix,
+					Namespace: request.Namespace,
+					Table:     request.Table,
+				},
+				historyOK: len(history) == 1 && string(history[0].Body) == string(request.Body),
+			}
+
+			request.Header.Set("X-Mutated", "yes")
+			request.Body[0] = '['
+			observed <- got
+
+			return Response{
+				Status: http.StatusCreated,
+				Header: http.Header{"X-Plan-Responder": {"dynamic"}},
+				Body:   json.RawMessage(`{"status":"completed","plan-id":"dynamic-plan"}`),
+			}, nil
+		},
+	})
+	client := srv.server.Client()
+	client.Timeout = 5 * time.Second
+
+	response, body := doPlanFakeRequest(t, client, http.MethodPost,
+		srv.URL()+"/v1/catalog/namespaces/db/tables/events/plan", `{"snapshot-id":17}`)
+	assert.Equal(t, http.StatusCreated, response.StatusCode)
+	assert.Equal(t, "dynamic", response.Header.Get("X-Plan-Responder"))
+	assert.JSONEq(t, `{"status":"completed","plan-id":"dynamic-plan"}`, string(body))
+
+	got := <-observed
+	assert.Equal(t, `{"snapshot-id":17}`, got.body)
+	assert.Equal(t, ExpectedTarget{Prefix: "catalog", Namespace: "db", Table: "events"}, got.target)
+	assert.True(t, got.historyOK, "responder must run after capture and outside the server mutex")
+
+	history := srv.Requests()
+	require.Len(t, history, 1)
+	assert.Empty(t, history[0].Header.Get("X-Mutated"))
+	assert.JSONEq(t, `{"snapshot-id":17}`, string(history[0].Body))
+}
+
+func TestServerInvokesDynamicPlanResponderConcurrently(t *testing.T) {
+	t.Parallel()
+
+	const requestCount = 2
+	entered := make(chan struct{}, requestCount)
+	release := make(chan struct{})
+	srv := New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Namespace: "db", Table: "events"},
+		PlanResponder: func(ctx context.Context, request Request) (Response, error) {
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return Response{}, ctx.Err()
+			}
+
+			return Response{Body: append(json.RawMessage(nil), request.Body...)}, nil
+		},
+	})
+
+	type result struct {
+		body []byte
+		err  error
+	}
+	results := make(chan result, requestCount)
+	client := srv.server.Client()
+	client.Timeout = 5 * time.Second
+	for i := range requestCount {
+		go func() {
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+				srv.URL()+"/v1/namespaces/db/tables/events/plan",
+				strings.NewReader(fmt.Sprintf(`{"request":%d}`, i)))
+			if err != nil {
+				results <- result{err: err}
+
+				return
+			}
+			response, err := client.Do(request)
+			if err != nil {
+				results <- result{err: err}
+
+				return
+			}
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			results <- result{body: body, err: errors.Join(readErr, closeErr)}
+		}()
+	}
+
+	deadline := time.After(5 * time.Second)
+	for range requestCount {
+		select {
+		case <-entered:
+		case <-deadline:
+			t.Fatal("dynamic plan responders were serialized or did not start")
+		}
+	}
+	close(release)
+
+	gotBodies := make([]string, 0, requestCount)
+	for range requestCount {
+		got := <-results
+		require.NoError(t, got.err)
+		gotBodies = append(gotBodies, string(got.body))
+	}
+	assert.ElementsMatch(t, []string{`{"request":0}`, `{"request":1}`}, gotBodies)
+	assert.Len(t, srv.Requests(), requestCount)
+}
+
+func TestServerDynamicPlanResponderErrorIsScenarioError(t *testing.T) {
+	t.Parallel()
+
+	srv := New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Namespace: "db", Table: "events"},
+		PlanResponder: func(context.Context, Request) (Response, error) {
+			return Response{}, errors.New("planner boom")
+		},
+	})
+
+	response, body := doPlanFakeRequest(t, srv.server.Client(), http.MethodPost,
+		srv.URL()+"/v1/namespaces/db/tables/events/plan", `{}`)
+	assertPlanFakeScenarioError(t, response, body)
+	assert.Contains(t, string(body), "planner boom")
+	require.NoError(t, srv.AcknowledgeScenarioErrors("plan responder failed: planner boom"))
+	assert.Len(t, srv.Requests(), 1)
+}
+
+func TestServerRejectsStaticAndDynamicPlanResponses(t *testing.T) {
+	t.Parallel()
+
+	var invoked atomic.Bool
+	srv := New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Namespace: "db", Table: "events"},
+		PlanResponse:   Response{Status: http.StatusOK},
+		PlanResponder: func(context.Context, Request) (Response, error) {
+			invoked.Store(true)
+
+			return Response{}, nil
+		},
+	})
+
+	response, body := doPlanFakeRequest(t, srv.server.Client(), http.MethodPost,
+		srv.URL()+"/v1/namespaces/db/tables/events/plan", `{}`)
+	assertPlanFakeScenarioError(t, response, body)
+	assert.False(t, invoked.Load())
+	require.NoError(t, srv.AcknowledgeScenarioErrors(
+		"plan response and plan responder are both configured; configure exactly one"))
+}
+
+func TestServerCancelsDynamicPlanResponderWithRequest(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	responderErr := make(chan error, 1)
+	srv := New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Namespace: "db", Table: "events"},
+		PlanResponder: func(ctx context.Context, _ Request) (Response, error) {
+			close(started)
+			<-ctx.Done()
+			responderErr <- ctx.Err()
+
+			return Response{}, ctx.Err()
+		},
+	})
+
+	requestCtx, cancel := context.WithCancel(t.Context())
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost,
+		srv.URL()+"/v1/namespaces/db/tables/events/plan", strings.NewReader(`{}`))
+	require.NoError(t, err)
+	requestResult := make(chan error, 1)
+	go func() {
+		response, err := srv.server.Client().Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestResult <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dynamic plan responder did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-requestResult:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("request cancellation did not release the dynamic plan responder")
+	}
+	select {
+	case err := <-responderErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dynamic plan responder did not observe request cancellation")
+	}
+	assert.Empty(t, srv.ScenarioErrors())
+}
+
+func TestServerCloseCancelsDynamicPlanResponder(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	responderErr := make(chan error, 1)
+	srv := New(t, Scenario{
+		ExpectedTarget: &ExpectedTarget{Namespace: "db", Table: "events"},
+		PlanResponder: func(ctx context.Context, _ Request) (Response, error) {
+			close(started)
+			<-ctx.Done()
+			responderErr <- ctx.Err()
+
+			return Response{}, ctx.Err()
+		},
+	})
+
+	requestResult := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+			srv.URL()+"/v1/namespaces/db/tables/events/plan", strings.NewReader(`{}`))
+		if err != nil {
+			requestResult <- err
+
+			return
+		}
+		response, err := srv.server.Client().Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestResult <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dynamic plan responder did not start")
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case err := <-responderErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server close did not cancel the dynamic plan responder")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server close remained blocked on the dynamic plan responder")
+	}
+	select {
+	case err := <-requestResult:
+		require.Error(t, err, "server close must abort the in-flight plan response")
+	case <-time.After(5 * time.Second):
+		t.Fatal("server close did not release the in-flight request")
+	}
+	assert.Empty(t, srv.ScenarioErrors())
 }
 
 func TestServerHandlesConcurrentPollAndTaskRequests(t *testing.T) {

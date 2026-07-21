@@ -276,11 +276,54 @@ func (s *Server) serveHTTP(w http.ResponseWriter, req *http.Request) {
 		captured.PlanTask = taskRequest.PlanTask
 	}
 
-	response := s.responseFor(route, captured)
+	response, responder := s.responseFor(route, captured)
+	if responder != nil {
+		responderCtx, cancelResponder := s.planResponderContext(req.Context())
+		response, err = responder(responderCtx, cloneRequest(captured))
+		responderCanceled := responderCtx.Err() != nil
+		serverClosed := s.isClosed()
+		cancelResponder()
+		if serverClosed {
+			panic(http.ErrAbortHandler)
+		}
+		if responderCanceled {
+			return
+		}
+		if err != nil {
+			response = s.scenarioErrorResponse(fmt.Sprintf("plan responder failed: %v", err))
+		} else {
+			response = cloneResponse(response)
+		}
+		if s.isClosed() {
+			panic(http.ErrAbortHandler)
+		}
+	}
 	if !s.waitForGate(req.Context(), response.Gate) {
 		return
 	}
 	writeResponse(w, response)
+}
+
+func (s *Server) planResponderContext(requestCtx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(requestCtx)
+	go func() {
+		select {
+		case <-s.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return ctx, cancel
+}
+
+func (s *Server) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) waitForGate(ctx context.Context, gate <-chan struct{}) bool {
@@ -347,14 +390,14 @@ func (s *Server) scenarioErrorResponseLocked(message string) Response {
 	return scenarioError(message)
 }
 
-func (s *Server) responseFor(route route, request Request) Response {
+func (s *Server) responseFor(route route, request Request) (Response, PlanResponder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.requests = append(s.requests, cloneRequest(request))
 	if route.kind != routeConfig && route.kind != routeUnknown {
 		if targetError := validateTarget(s.scenario.ExpectedTarget, route); targetError != "" {
-			return s.scenarioErrorResponseLocked(targetError)
+			return s.scenarioErrorResponseLocked(targetError), nil
 		}
 	}
 
@@ -362,28 +405,35 @@ func (s *Server) responseFor(route route, request Request) Response {
 	case routeConfig:
 		if isZeroResponse(s.scenario.ConfigResponse) {
 			return s.scenarioErrorResponseLocked(
-				"config response is not configured; use an explicit 200 response to model an empty body")
+				"config response is not configured; use an explicit 200 response to model an empty body"), nil
 		}
 
-		return cloneResponse(s.scenario.ConfigResponse)
+		return cloneResponse(s.scenario.ConfigResponse), nil
 	case routePlan:
+		if s.scenario.PlanResponder != nil && !isZeroResponse(s.scenario.PlanResponse) {
+			return s.scenarioErrorResponseLocked(
+				"plan response and plan responder are both configured; configure exactly one"), nil
+		}
+		if s.scenario.PlanResponder != nil {
+			return Response{}, s.scenario.PlanResponder
+		}
 		if isZeroResponse(s.scenario.PlanResponse) {
 			return s.scenarioErrorResponseLocked(
-				"plan response is not configured; use an explicit 200 response to model an empty body")
+				"plan response is not configured; use an explicit 200 response to model an empty body"), nil
 		}
 
-		return cloneResponse(s.scenario.PlanResponse)
+		return cloneResponse(s.scenario.PlanResponse), nil
 	case routePoll:
 		response := s.nextResponse("poll", route.planID, s.scenario.PollResponses, s.pollCounts)
 		s.signalPollChangedLocked()
 
-		return response
+		return response, nil
 	case routeCancel:
-		return s.nextResponse("cancel", route.planID, s.scenario.CancelResponses, s.cancelCounts)
+		return s.nextResponse("cancel", route.planID, s.scenario.CancelResponses, s.cancelCounts), nil
 	case routeTasks:
-		return s.nextResponse("task", request.PlanTask, s.scenario.TaskResponses, s.taskCounts)
+		return s.nextResponse("task", request.PlanTask, s.scenario.TaskResponses, s.taskCounts), nil
 	default:
-		return s.scenarioErrorResponseLocked(fmt.Sprintf("unexpected request %s %s", request.Method, request.Path))
+		return s.scenarioErrorResponseLocked(fmt.Sprintf("unexpected request %s %s", request.Method, request.Path)), nil
 	}
 }
 
