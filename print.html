@@ -542,12 +542,14 @@ catalog:
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>default-catalog</code></td><td>Name used when <code>--catalog-name</code> is not passed on the CLI.</td></tr>
 <tr><td><code>max-workers</code></td><td>Worker pool size for concurrent operations. Default <code>5</code>.</td></tr>
-<tr><td><code>catalog.&lt;name&gt;.type</code></td><td>One of <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.type</code></td><td>One of <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>. <code>dynamodb</code> is recognized by the CLI but not implemented yet.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.uri</code></td><td>Catalog endpoint or DSN.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.warehouse</code></td><td>Warehouse identifier (REST/Glue) or location (Hive/SQL).</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.credential</code></td><td>Credential string passed through to the catalog's auth handler.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.output</code></td><td>CLI output format (e.g. <code>text</code>, <code>json</code>).</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.aws-profile</code></td><td>AWS named profile for the Glue catalog. When unset, the AWS SDK default credential chain is used.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.sql-driver</code></td><td><code>database/sql</code> driver name for the SQL catalog. Maps to the <code>sql.driver</code> property. The default CLI binary only compiles in <code>sqliteshim</code>; other drivers require a custom build.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.sql-dialect</code></td><td>SQL dialect for the SQL catalog (<code>postgres</code>, <code>mysql</code>, <code>sqlite</code>, <code>mssql</code>, <code>oracle</code>). Maps to the <code>sql.dialect</code> property. The default CLI binary only ships <code>sqlite</code> via <code>sqliteshim</code>; other dialects need a custom build with their drivers.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-name</code></td><td>SigV4 service name.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-region</code></td><td>SigV4 region.</td></tr>
@@ -565,6 +567,29 @@ catalog:
 <tr><td>Pass-through</td><td><code>WithAdditionalProps</code></td></tr>
 </tbody></table>
 </div>
+<h4 id="metrics-reporting"><a class="header" href="#metrics-reporting">Metrics reporting</a></h4>
+<p>The REST catalog can POST scan and commit metrics to the catalog's
+<code>.../tables/{table}/metrics</code> endpoint. These properties are passed as
+client-supplied catalog properties.</p>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>rest-metrics-reporting-enabled</code></td><td>Opt into POSTing metrics reports. <strong>Off by default.</strong></td></tr>
+<tr><td><code>rest.metrics-reporting-enabled</code></td><td>Legacy dotted alias; consulted only when the canonical key above is absent.</td></tr>
+<tr><td><code>rest-metrics-reporting-timeout-ms</code></td><td>Per-report request/response deadline in milliseconds. Default <code>10000</code>.</td></tr>
+</tbody></table>
+</div>
+<blockquote>
+<p><strong>Note on cross-client parity.</strong> Iceberg Java defaults metrics reporting to
+<em>on</em> (<code>METRICS_REPORTING_ENABLED_DEFAULT=true</code>); iceberg-go deliberately
+defaults it <em>off</em>, so no client emits new outbound telemetry unless it
+explicitly opts in. A Java client that never set the flag will therefore stop
+reporting when ported here until <code>rest-metrics-reporting-enabled=true</code> is set.
+Enablement is read from client properties only — a server cannot turn on
+reporting the client never asked for — but an explicit server override setting
+the flag to <code>false</code> <em>is</em> honored (disabling is always safe), so an operator can
+suppress reporting fleet-wide. <code>rest-metrics-reporting-timeout-ms</code> is a
+Go-specific extension with no Java, PyIceberg, or Rust equivalent; do not
+assume parity on it in multi-client deployments.</p>
+</blockquote>
 <h3 id="hive-cataloghive"><a class="header" href="#hive-cataloghive">Hive (<code>catalog/hive</code>)</a></h3>
 <p>Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/hive/options.go"><code>catalog/hive/options.go</code></a>.</p>
 <ul>
@@ -572,6 +597,15 @@ catalog:
 <li><code>WithWarehouse(warehouse string)</code></li>
 <li><code>WithProperties(props iceberg.Properties)</code></li>
 </ul>
+<p>Lock-check catalog properties (passed via <code>WithProperties</code> / <code>catalog.Load</code> props):</p>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>iceberg.hive.lock-check-min-wait-ms</code></td><td><code>50</code></td><td>Minimum wait between lock-status checks, in milliseconds. Matches the Java Hive catalog key.</td></tr>
+<tr><td><code>iceberg.hive.lock-check-max-wait-ms</code></td><td><code>5000</code></td><td>Maximum wait between lock-status checks, in milliseconds. Matches the Java Hive catalog key.</td></tr>
+<tr><td><code>lock-check-min-wait-time</code> / <code>lock-check-max-wait-time</code></td><td>same defaults</td><td>Legacy Go aliases that accept Go duration strings (e.g. <code>100ms</code>, <code>5s</code>). Ignored when the corresponding Java key is set.</td></tr>
+<tr><td><code>lock-check-retries</code></td><td><code>4</code></td><td>Go-specific upper bound on check attempts. Java instead uses <code>iceberg.hive.lock-timeout-ms</code> (not wired in Go yet).</td></tr>
+</tbody></table>
+</div>
+<p>Invalid values (non-positive waits/retries, or min ≥ max) are ignored and the previous/default settings are kept.</p>
 <h3 id="glue-catalogglue"><a class="header" href="#glue-catalogglue">Glue (<code>catalog/glue</code>)</a></h3>
 <p>Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/glue/options.go"><code>catalog/glue/options.go</code></a>.</p>
 <ul>
@@ -614,6 +648,7 @@ cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Pr
 <tr><td><code>s3.proxy-uri</code> (<code>io.S3ProxyURI</code>)</td><td>HTTP proxy URL.</td></tr>
 <tr><td><code>s3.connect-timeout</code> (<code>io.S3ConnectTimeout</code>)</td><td>Either a number of seconds (<code>&quot;60&quot;</code>, <code>&quot;60.0&quot;</code>) or a Go duration (<code>&quot;5s&quot;</code>).</td></tr>
 <tr><td><code>s3.force-virtual-addressing</code> (<code>io.S3ForceVirtualAddressing</code>)</td><td>Force virtual-host-style addressing.</td></tr>
+<tr><td><code>s3.compat-mode</code> (<code>io.S3CompatMode</code>)</td><td>Enable for non-AWS S3 endpoints. Defaults to off.</td></tr>
 <tr><td><code>s3.signer.uri</code> (<code>io.S3SignerURI</code>)</td><td>Reserved for remote-signing endpoint (not yet implemented).</td></tr>
 </tbody></table>
 </div>
@@ -738,12 +773,13 @@ func init() {
 </div>
 <h3 id="snapshot-retention"><a class="header" href="#snapshot-retention">Snapshot retention</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>min-snapshots-to-keep</code></td><td>Minimum snapshots to retain when expiring.</td></tr>
-<tr><td><code>max-snapshot-age-ms</code></td><td>Maximum age of retained snapshots.</td></tr>
-<tr><td><code>max-ref-age-ms</code></td><td>Maximum age of branch/tag refs that are not the main branch.</td></tr>
+<tr><td><code>history.expire.min-snapshots-to-keep</code></td><td>Minimum snapshots to retain when expiring. Default <code>1</code>.</td></tr>
+<tr><td><code>history.expire.max-snapshot-age-ms</code></td><td>Maximum age of retained snapshots. Default <code>432000000</code> (5 days).</td></tr>
+<tr><td><code>history.expire.max-ref-age-ms</code></td><td>Maximum age of branch/tag refs that are not the main branch. Default <code>Long.MAX_VALUE</code> (forever).</td></tr>
 <tr><td><code>gc.enabled</code></td><td>Gate for orphan-file cleanup.</td></tr>
 </tbody></table>
 </div>
+<p>The unprefixed retention property names are accepted as compatibility fallbacks. The <code>history.expire.*</code> properties take precedence when both forms are set.</p>
 <h3 id="delete-mode"><a class="header" href="#delete-mode">Delete mode</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>write.delete.mode</code></td><td>Delete strategy used by row-level delete writers.</td></tr>
@@ -770,10 +806,13 @@ func init() {
 <tr><td><code>write.parquet.compression-level</code></td><td><code>-1</code> (codec default)</td></tr>
 <tr><td><code>write.parquet.bloom-filter-max-bytes</code></td><td>1 MB</td></tr>
 <tr><td><code>write.parquet.bloom-filter-enabled.column.&lt;name&gt;</code></td><td>(per-column toggle, prefix-matched)</td></tr>
+<tr><td><code>parquet.enable.dictionary</code></td><td><code>true</code> (global dictionary encoding switch; same key as Iceberg Java)</td></tr>
+<tr><td><code>write.parquet.dict-encoding-enabled.column.&lt;name&gt;</code></td><td>(per-column toggle, prefix-matched; overrides the global switch)</td></tr>
 <tr><td><code>write.parquet.shred-variants</code></td><td><code>false</code> (opt-in shredding of top-level variant columns)</td></tr>
 <tr><td><code>write.parquet.variant-inference-buffer-size</code></td><td>100 rows (buffered per file to infer the shredding schema)</td></tr>
 </tbody></table>
 </div>
+<p>The bloom filter and dictionary toggles are parsed the way Iceberg Java parses them: only <code>true</code> (case-insensitive) enables, so any other value — including <code>1</code> — reads as <code>false</code>.</p>
 <h3 id="parquet-reader"><a class="header" href="#parquet-reader">Parquet reader</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>read.parquet.batch-size</code></td><td>Arrow record-batch size used by the Parquet reader.</td></tr>
@@ -814,8 +853,8 @@ docker run -p 8181:8181 apache/iceberg-rest-fixture:latest
 </code></pre>
 <p>Catalog connection flags are global and apply to every subcommand:</p>
 <div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>--catalog</code></td><td>Catalog type: <code>rest</code> (default), <code>glue</code>, <code>hive</code>, <code>hadoop</code></td></tr>
-<tr><td><code>--uri</code></td><td>Catalog URI (REST/Hive)</td></tr>
+<tr><td><code>--catalog</code></td><td>Catalog type: <code>rest</code> (default), <code>glue</code>, <code>hive</code>, <code>hadoop</code>, <code>sql</code>. <code>dynamodb</code> is recognized but not implemented yet.</td></tr>
+<tr><td><code>--uri</code></td><td>Catalog URI (REST/Hive) or SQL DSN</td></tr>
 <tr><td><code>--warehouse</code></td><td>Warehouse location</td></tr>
 <tr><td><code>--credential</code></td><td>Credentials for the catalog</td></tr>
 <tr><td><code>--token</code></td><td>OAuth token (skips OAuth flow)</td></tr>
@@ -823,6 +862,8 @@ docker run -p 8181:8181 apache/iceberg-rest-fixture:latest
 <tr><td><code>--catalog-name</code></td><td>Catalog name to load from config file (default <code>default</code>)</td></tr>
 <tr><td><code>--config</code></td><td>Path to a config file</td></tr>
 <tr><td><code>--aws-profile</code></td><td>AWS named profile to use (Glue catalog); overrides <code>aws-profile</code> in the config file</td></tr>
+<tr><td><code>--sql-driver</code></td><td><code>database/sql</code> driver name for the SQL catalog. The default CLI binary only compiles in <code>sqliteshim</code>; other drivers require a custom build.</td></tr>
+<tr><td><code>--sql-dialect</code></td><td>SQL dialect for the SQL catalog. The SQL catalog library supports <code>postgres</code>, <code>mysql</code>, <code>sqlite</code>, <code>mssql</code>, and <code>oracle</code>, but the default CLI binary only ships the <code>sqlite</code> dialect via <code>sqliteshim</code>. Other dialects need a custom build that blank-imports their <code>database/sql</code> drivers.</td></tr>
 </tbody></table>
 </div>
 <p>To avoid passing flags every time, define a config file at <code>~/.iceberg-go.yaml</code>:</p>
@@ -832,6 +873,15 @@ catalog:
     type: rest
     uri: http://localhost:8181
     warehouse: s3://my-warehouse
+</code></pre>
+<p>SQL catalog example:</p>
+<pre><code class="language-yaml">catalog:
+  local:
+    type: sql
+    uri: file:iceberg-catalog.db
+    warehouse: file:///tmp/warehouse
+    sql-driver: sqliteshim
+    sql-dialect: sqlite
 </code></pre>
 <p>Flags on the command line override values from the config file.</p>
 <h2 id="output-format"><a class="header" href="#output-format">Output format</a></h2>
@@ -1385,7 +1435,7 @@ err := txn.ExpireSnapshots(/* options */)
 // Roll back to a previous snapshot
 err = txn.RollbackToSnapshot(targetSnapshotID)
 </code></pre>
-<p>Tune retention with the <code>min-snapshots-to-keep</code>, <code>max-snapshot-age-ms</code>, and <code>max-ref-age-ms</code> table properties (see <a href="./configuration.html">Configuration</a>).</p>
+<p>Tune retention with the <code>history.expire.min-snapshots-to-keep</code>, <code>history.expire.max-snapshot-age-ms</code>, and <code>history.expire.max-ref-age-ms</code> table properties (see <a href="./configuration.html">Configuration</a>).</p>
 <h2 id="maintenance"><a class="header" href="#maintenance">Maintenance</a></h2>
 <h3 id="orphan-file-cleanup"><a class="header" href="#orphan-file-cleanup">Orphan file cleanup</a></h3>
 <pre><code class="language-go">import (
