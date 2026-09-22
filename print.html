@@ -760,8 +760,14 @@ func init() {
 <h3 id="scan-reads"><a class="header" href="#scan-reads">Scan reads</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>read.split.target-size</code></td><td><code>134217728</code></td><td>Target size for coalescing safe row-group ranges when splitting large local Parquet files. A range may exceed the target when no supplied offset can divide it safely.</td></tr>
+<tr><td><code>read.manifest-list-cache.enabled</code></td><td><code>true</code></td><td>Reuse decoded snapshot manifest lists across scans of a table handle. Set to <code>false</code> to disable retention and shared in-flight reads. Applied when loading or refreshing a table, and when creating a transaction scan.</td></tr>
 </tbody></table>
 </div>
+<p>The manifest-list cache retains at most 64 snapshots and 32,768 manifest
+descriptors in total per table handle. These are count limits, not byte limits:
+memory use also depends on manifest paths, partition summaries, and key metadata.
+Refreshing the table replaces its cache. This caches decoded manifest lists;
+it does not implement Java's <code>io.manifest.cache.*</code> file-content cache settings.</p>
 <p>The Java-compatible <code>read.split.planning-lookback</code> and <code>read.split.open-file-cost</code>
 names and defaults are also exported by the Go API for shared configuration,
 but are reserved for future task-group planning and are not currently read.</p>
@@ -2377,6 +2383,10 @@ go test -tags integration ./...
 <p>To track <code>main</code>, use <code>@main</code> instead of a version tag.</p>
 <h2 id="release-notes"><a class="header" href="#release-notes">Release notes</a></h2>
 <p>Per-release notes (highlights, breaking changes, contributors) are published on the <a href="https://github.com/apache/iceberg-go/releases">GitHub Releases page</a>. Iceberg Go does not maintain a curated <code>CHANGELOG.md</code> in the repository; the GitHub Releases page is the canonical source.</p>
+<h3 id="unreleased-compatibility-notes"><a class="header" href="#unreleased-compatibility-notes">Unreleased compatibility notes</a></h3>
+<ul>
+<li><code>Table.PurgeFiles</code> now calls <code>IO.Remove</code> concurrently, with up to 32 calls in flight, when the filesystem does not implement <code>BulkRemovableIO</code>. Custom IO implementations, including those registered with <code>io.Register</code>, must make <code>Remove</code> safe for concurrent use and synchronize any shared mutable state. The bulk deletion path is unchanged.</li>
+</ul>
 <h2 id="verifying-and-producing-releases"><a class="header" href="#verifying-and-producing-releases">Verifying and producing releases</a></h2>
 <p>If you are validating an RC or cutting a new release, see:</p>
 <ul>
