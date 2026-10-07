@@ -273,7 +273,7 @@
 <p>In this quickstart, we’ll glean insights from code segments and learn how to:</p>
 <h2 id="requirements"><a class="header" href="#requirements">Requirements</a></h2>
 <div class="warning">
-Go 1.25 or later is required to build.
+Go 1.26 or later is required to build.
 </div>
 <h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
 <p>To install <code>iceberg-go</code> package, you need to install Go and set your Go workspace first.
@@ -550,7 +550,7 @@ catalog:
 <tr><td><code>catalog.&lt;name&gt;.aws-profile</code></td><td>AWS named profile for the Glue catalog. When unset, the AWS SDK default credential chain is used.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-driver</code></td><td><code>database/sql</code> driver name for the SQL catalog. Maps to the <code>sql.driver</code> property. The default CLI binary only compiles in <code>sqliteshim</code>; other drivers require a custom build.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-dialect</code></td><td>SQL dialect for the SQL catalog (<code>postgres</code>, <code>mysql</code>, <code>sqlite</code>, <code>mssql</code>, <code>oracle</code>). Maps to the <code>sql.dialect</code> property. The default CLI binary only ships <code>sqlite</code> via <code>sqliteshim</code>; other dialects need a custom build with their drivers.</td></tr>
-<tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST. When enabled, requests are signed with the <code>s3.*</code> credential properties if set (<code>s3.access-key-id</code> / <code>s3.secret-access-key</code> / <code>s3.session-token</code>), otherwise with the AWS default credential chain. The Java-client names (<code>rest.access-key-id</code> / <code>rest.secret-access-key</code> / <code>rest.session-token</code>) are accepted as aliases, resolved per field with the <code>s3.*</code> keys taking precedence.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-name</code></td><td>SigV4 service name.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.signing-region</code></td><td>SigV4 region.</td></tr>
 </tbody></table>
@@ -561,12 +561,36 @@ catalog:
 <p>The most option-rich surface. Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/options.go"><code>catalog/rest/options.go</code></a>.</p>
 <div class="table-wrapper"><table><thead><tr><th>Group</th><th>Options</th></tr></thead><tbody>
 <tr><td>Authentication</td><td><code>WithCredential</code>, <code>WithOAuthToken</code>, <code>WithAuthManager</code>, <code>WithAuthURI</code>, <code>WithScope</code>, <code>WithAudience</code>, <code>WithResource</code></td></tr>
-<tr><td>AWS SigV4</td><td><code>WithSigV4</code>, <code>WithSigV4RegionSvc</code>, <code>WithAwsConfig</code></td></tr>
+<tr><td>AWS SigV4</td><td><code>WithSigV4</code>, <code>WithSigV4RegionSvc</code>, <code>WithSigner</code></td></tr>
 <tr><td>HTTP</td><td><code>WithHeaders</code>, <code>WithTLSConfig</code>, <code>WithOAuthTLSConfig</code>, <code>WithCustomTransport</code></td></tr>
 <tr><td>Catalog routing</td><td><code>WithPrefix</code>, <code>WithWarehouseLocation</code>, <code>WithMetadataLocation</code></td></tr>
 <tr><td>Pass-through</td><td><code>WithAdditionalProps</code></td></tr>
 </tbody></table>
 </div>
+<blockquote>
+<p><strong>AWS SigV4 is an optional backend.</strong> <code>catalog/rest</code> no longer links the AWS
+SDK. To sign REST requests with SigV4, pull in the
+<a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/sigv4/sigv4.go"><code>catalog/rest/sigv4</code></a>
+sub-package one of two ways:</p>
+<ul>
+<li>Property or ambient credentials: add a blank import
+<code>_ &quot;github.com/apache/iceberg-go/catalog/rest/sigv4&quot;</code> and enable signing with
+<code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> or the <code>rest.sigv4-enabled</code> property. The
+backend signs with the <code>s3.*</code> credential properties when set (falling back to
+the <code>rest.*</code> aliases), otherwise with the AWS default credential chain.</li>
+<li>Explicit config: pass <code>sigv4.WithAwsConfig(cfg)</code> to <code>NewCatalog</code> alongside
+<code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> (no blank import needed). It supplies the
+<code>aws.Config</code>; the signing service comes from those options (or a server
+<code>/v1/config</code> override), and so does the region when one is set. Otherwise
+the region falls back to <code>cfg.Region</code>.</li>
+</ul>
+<p>The former <code>rest.WithAwsConfig(aws.Config)</code> has been removed in favor of these
+paths. Because signing is enabled by <code>WithSigV4</code> / <code>WithSigV4RegionSvc</code> (or the
+<code>rest.sigv4-enabled</code> property) rather than by supplying a config, a program
+that loads a REST catalog with <code>rest.sigv4-enabled=true</code> now fails at startup
+until the <code>catalog/rest/sigv4</code> backend is blank-imported; the error names the
+import to add.</p>
+</blockquote>
 <h4 id="metrics-reporting"><a class="header" href="#metrics-reporting">Metrics reporting</a></h4>
 <p>The REST catalog can POST scan and commit metrics to the catalog's
 <code>.../tables/{table}/metrics</code> endpoint. These properties are passed as
@@ -932,7 +956,7 @@ catalog:
 </code></pre>
 <p><strong>Create table</strong></p>
 <p>Note: only the identity transform is supported for <code>--partition-spec</code> at this moment.</p>
-<pre><code class="language-shell"># Create a simple table with REST catalog and Minio
+<pre><code class="language-shell"># Create a simple table with REST catalog and object store
 ./iceberg create table default.table-1 \
         --properties write.format.default=parquet \
         --partition-spec foo \
@@ -1473,18 +1497,18 @@ err = txn.RollbackToSnapshot(targetSnapshotID)
 <pre><code class="language-go">import (
     &quot;time&quot;
 
-    &quot;github.com/apache/iceberg-go/table&quot;
+    &quot;github.com/apache/iceberg-go/table/maintenance&quot;
 )
 
-result, err := tbl.DeleteOrphanFiles(ctx,
-    table.WithFilesOlderThan(72*time.Hour),
-    table.WithDryRun(false),
-    table.WithCleanupMaxConcurrency(8),
+result, err := maintenance.DeleteOrphanFiles(ctx, tbl,
+    maintenance.WithCleanupFilesOlderThan(72*time.Hour),
+    maintenance.WithCleanupDryRun(false),
+    maintenance.WithCleanupMaxConcurrency(8),
 )
 if err != nil { /* ... */ }
 fmt.Printf(&quot;removed %d files\n&quot;, len(result.DeletedFiles))
 </code></pre>
-<p>Also see <code>table.WithLocation</code>, <code>table.WithDeleteFunc</code>, <code>table.WithPrefixMismatchMode</code>, <code>table.WithEqualSchemes</code>, and <code>table.WithEqualAuthorities</code> in <code>table/orphan_cleanup.go</code>.</p>
+<p>Also see <code>maintenance.WithCleanupLocation</code>, <code>maintenance.WithCleanupDeleteFunc</code>, <code>maintenance.WithPrefixMismatchMode</code>, <code>maintenance.WithEqualSchemes</code>, and <code>maintenance.WithEqualAuthorities</code> in <code>table/maintenance/orphan_cleanup.go</code>.</p>
 <h3 id="compaction-rewrite-data-files"><a class="header" href="#compaction-rewrite-data-files">Compaction (rewrite data files)</a></h3>
 <pre><code class="language-go">import &quot;github.com/apache/iceberg-go/table&quot;
 
@@ -2135,16 +2159,20 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td>Nanosecond timestamps (<code>timestamp_ns</code>, <code>timestamptz_ns</code>)</td><td>Supported</td></tr>
 <tr><td>Default values (<code>initial-default</code>, <code>write-default</code>)</td><td>Supported</td></tr>
 <tr><td>Row lineage (<code>_row_id</code>, <code>_last_updated_sequence_number</code>)</td><td>Supported</td></tr>
-<tr><td>Encryption keys in metadata</td><td>Supported</td></tr>
+<tr><td>Encryption keys in metadata</td><td>Supported (metadata-level storage + <code>EncryptionManager</code> interface; file-level envelope encryption not yet implemented <a href="https://github.com/apache/iceberg-go/pull/1620">PR #1620 in review</a>)</td></tr>
 <tr><td>Variant type, non-shredded</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/932">#932</a>; umbrella <a href="https://github.com/apache/iceberg-go/issues/929">#929</a>)</td></tr>
 <tr><td>Variant type, shredded reader / writer</td><td>Supported (reader <a href="https://github.com/apache/iceberg-go/pull/1238">#1238</a>, writer <a href="https://github.com/apache/iceberg-go/pull/1351">#1351</a>)</td></tr>
 <tr><td>Variant predicate pushdown / field extract</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1607">#1607</a>)</td></tr>
 <tr><td>Deletion vectors, read</td><td>Supported</td></tr>
 <tr><td>Deletion vectors, write (unpartitioned)</td><td>Supported</td></tr>
-<tr><td>Deletion vectors, write (partitioned)</td><td>In progress (<a href="https://github.com/apache/iceberg-go/issues/1135">#1135</a>, PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
+<tr><td>Deletion vectors, write (partitioned)</td><td>Supported (PR <a href="https://github.com/apache/iceberg-go/pull/1151">#1151</a>)</td></tr>
 <tr><td>Geometry / Geography types (schema)</td><td>Supported</td></tr>
-<tr><td>Geometry / Geography (transforms, statistics, pruning)</td><td>In progress (umbrella <a href="https://github.com/apache/iceberg-go/issues/989">#989</a>)</td></tr>
+<tr><td>Geometry: statistics and pruning</td><td>Supported</td></tr>
+<tr><td>Geography: read, write, and schema</td><td>Supported (bounds/pruning intentionally omitted for geodesic safety)</td></tr>
+<tr><td>Geometry / Geography: nested-geo bounds</td><td>Deferred</td></tr>
 <tr><td>Multi-argument transforms</td><td>Infrastructure present; no concrete implementations exercised yet</td></tr>
+<tr><td>Statistics files (read / round-trip)</td><td>Supported</td></tr>
+<tr><td>NDV (Theta-sketch) statistics computation</td><td>Roadmap (<a href="https://github.com/apache/iceberg-go/issues/1929">#1929</a>)</td></tr>
 </tbody></table>
 </div>
 <h2 id="filesystem-support"><a class="header" href="#filesystem-support">FileSystem support</a></h2>
@@ -2203,7 +2231,7 @@ instance to <code>table.WithReporter</code> or <code>table.WithMetricsReporter</
 <tr><td style="text-align: left">Append Stream</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Append Data Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Rewrite Files</td><td style="text-align: center">X</td></tr>
-<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center"></td></tr>
+<tr><td style="text-align: left">Rewrite manifests</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Overwrite Files</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Copy-On-Write Delete</td><td style="text-align: center">X</td></tr>
 <tr><td style="text-align: left">Write Pos Delete</td><td style="text-align: center">X</td></tr>
@@ -2276,7 +2304,7 @@ make test-race # runs all unit tests with race detector
 </code></pre>
 <h3 id="integration-tests"><a class="header" href="#integration-tests">Integration Tests</a></h3>
 <p>Integration tests require Docker and are gated behind a build tag:</p>
-<pre><code class="language-bash">docker compose -f internal/recipe/docker-compose.yml up -d rest minio mc --wait
+<pre><code class="language-bash">docker compose -f internal/recipe/docker-compose.yml up -d rest object-store create-bucket --wait
 go test -tags integration ./...
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div><!--
@@ -2512,7 +2540,19 @@ go test -tags integration ./...
 <p>Per-release notes (highlights, breaking changes, contributors) are published on the <a href="https://github.com/apache/iceberg-go/releases">GitHub Releases page</a>. Iceberg Go does not maintain a curated <code>CHANGELOG.md</code> in the repository; the GitHub Releases page is the canonical source.</p>
 <h3 id="unreleased-compatibility-notes"><a class="header" href="#unreleased-compatibility-notes">Unreleased compatibility notes</a></h3>
 <ul>
-<li><code>Table.PurgeFiles</code> now calls <code>IO.Remove</code> concurrently, with up to 32 calls in flight, when the filesystem does not implement <code>BulkRemovableIO</code>. Custom IO implementations, including those registered with <code>io.Register</code>, must make <code>Remove</code> safe for concurrent use and synchronize any shared mutable state. The bulk deletion path is unchanged.</li>
+<li>
+<p><strong>Orphan file cleanup moved to <code>table/maintenance</code>.</strong> The orphan-cleanup and file-purge API is no longer on <code>table.Table</code>; it now lives in the <code>table/maintenance</code> package as free functions that take the table as their first argument (matching <code>table/compaction</code>). For example, <code>tbl.DeleteOrphanFiles(ctx, ...)</code> becomes <code>maintenance.DeleteOrphanFiles(ctx, tbl, ...)</code>. Because <code>table/maintenance</code> imports <code>table</code> (and not the reverse), this cannot be offered as a deprecation shim on <code>table.Table</code> without an import cycle, so callers must switch to the new package. The following moved from <code>table</code> to <code>table/maintenance</code>:</p>
+<ul>
+<li>Functions (now free functions taking <code>*table.Table</code>): <code>DeleteOrphanFiles</code>, <code>PlanOrphanFiles</code>, <code>ExecuteOrphanCleanup</code>, <code>PurgeFiles</code>.</li>
+<li>Types: <code>OrphanCleanupOption</code>, <code>OrphanCleanupResult</code>, <code>OrphanFile</code>, <code>OrphanCleanupPlan</code>, <code>PrefixMismatchMode</code>.</li>
+<li>Constants: <code>PrefixMismatchError</code>, <code>PrefixMismatchIgnore</code>, <code>PrefixMismatchDelete</code>.</li>
+<li>Option constructors: <code>WithCleanupLocation</code>, <code>WithCleanupFilesOlderThan</code>, <code>WithCleanupDryRun</code>, <code>WithCleanupDeleteFunc</code>, <code>WithCleanupMaxConcurrency</code>, <code>WithPrefixMismatchMode</code>, <code>WithEqualSchemes</code>, <code>WithEqualAuthorities</code>. The four generic names (<code>WithLocation</code>, <code>WithFilesOlderThan</code>, <code>WithDryRun</code>, <code>WithDeleteFunc</code>) gained the <code>WithCleanup</code> prefix for consistency.</li>
+</ul>
+<p>Relatedly, the previously unexported <code>isGCEnabled</code> is now <code>table.IsGCEnabled</code>, so the new package can gate destructive operations on the <code>gc.enabled</code> table property.</p>
+</li>
+<li>
+<p><code>maintenance.PurgeFiles</code> (previously <code>Table.PurgeFiles</code>) now calls <code>IO.Remove</code> concurrently, with up to 32 calls in flight, when the filesystem does not implement <code>BulkRemovableIO</code>. Custom IO implementations, including those registered with <code>io.Register</code>, must make <code>Remove</code> safe for concurrent use and synchronize any shared mutable state. The bulk deletion path is unchanged.</p>
+</li>
 </ul>
 <h2 id="verifying-and-producing-releases"><a class="header" href="#verifying-and-producing-releases">Verifying and producing releases</a></h2>
 <p>If you are validating an RC or cutting a new release, see:</p>
