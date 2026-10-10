@@ -41,7 +41,8 @@ import (
 // (*Scan).PlanFiles enforces: a `server` table plans remotely and a `client`
 // table plans locally, whatever the default or ScanPlanningAuto would choose.
 // A scan that explicitly selects the conflicting mode fails. Incremental scans
-// and scans inside a transaction do not apply the directive.
+// only plan locally, so they fail under a `server` directive. Scans inside a
+// transaction plan staged metadata locally and do not apply the directive.
 type ScanPlanningMode string
 
 const (
@@ -96,9 +97,10 @@ const (
 // The directive is only known for tables built from a load response
 // (LoadTable, CreateTable, RegisterTable, and their refreshes); tables
 // returned by Transaction.Commit or StagedTable keep the directive of the
-// table they were derived from. Tables returned by a catalog's UpdateTable
-// report no directive, because commit responses do not carry table config;
-// reload the table to obtain it.
+// table they were derived from. Commit responses do not carry table config, so
+// a table returned by a REST catalog's UpdateTable reports only the catalog's
+// own `scan-planning-mode` property; reload the table to obtain a per-table
+// directive.
 //
 // (*Scan).PlanFiles enforces the directive; see ScanPlanningMode.
 func (t Table) ScanPlanningDirective() (ScanPlanningDirective, error) {
@@ -188,6 +190,32 @@ func (scan *Scan) effectivePlanningMode() (ScanPlanningMode, error) {
 		return ScanPlanningLocal, nil
 	default:
 		return scan.planningMode, nil
+	}
+}
+
+// checkLocalOnlyPlanning applies the catalog's scan-planning-mode directive to
+// a scan that can only plan locally, such as an incremental scan. A `server`
+// directive fails rather than reading manifests with the table's own
+// credentials, which the directive exists to prevent. kind names the scan in
+// errors.
+func (scan *Scan) checkLocalOnlyPlanning(kind string) error {
+	mode, err := scan.effectivePlanningMode()
+	if err != nil {
+		return err
+	}
+
+	switch mode {
+	case ScanPlanningLocal, ScanPlanningAuto:
+		return nil
+	case ScanPlanningRemote:
+		if scan.directive == ScanPlanningDirectiveServer {
+			return fmt.Errorf("%w: the catalog requires server-side scan planning (%s=%s) but %s scans do not support remote planning",
+				ErrInvalidOperation, ScanPlanningModeKey, ScanPlanningDirectiveServer, kind)
+		}
+
+		return fmt.Errorf("%w: %s scans do not support remote planning", ErrInvalidOperation, kind)
+	default:
+		return fmt.Errorf("%w: unknown scan planning mode %q", iceberg.ErrInvalidArgument, mode)
 	}
 }
 

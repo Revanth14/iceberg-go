@@ -888,3 +888,66 @@ func TestTransactionScanIgnoresPlanningDirective(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, planner.called, "transaction scans plan staged metadata locally")
 }
+
+// Incremental scans only plan locally, so a `server` directive must fail them
+// rather than let them read manifests with the table's own credentials.
+func TestIncrementalScansEnforcePlanningDirective(t *testing.T) {
+	t.Parallel()
+
+	scans := []struct {
+		name string
+		plan func(Table, ...ScanOption) error
+	}{
+		{name: "append", plan: func(tbl Table, opts ...ScanOption) error {
+			_, err := tbl.NewIncrementalAppendScan(opts...).PlanFiles(context.Background())
+
+			return err
+		}},
+		{name: "changelog", plan: func(tbl Table, opts ...ScanOption) error {
+			_, err := tbl.NewIncrementalChangelogScan(opts...).PlanFiles(context.Background())
+
+			return err
+		}},
+	}
+	tests := []struct {
+		name      string
+		directive *string
+		opts      []ScanOption
+		wantErr   error
+		wantMsg   string
+	}{
+		{name: "server default", directive: new("server"), wantErr: ErrInvalidOperation, wantMsg: "requires server-side scan planning"},
+		{name: "server auto", directive: new("server"), opts: []ScanOption{WithScanPlanningMode(ScanPlanningAuto)}, wantErr: ErrInvalidOperation, wantMsg: "requires server-side scan planning"},
+		{name: "server explicit local", directive: new("server"), opts: []ScanOption{WithScanPlanningMode(ScanPlanningLocal)}, wantErr: ErrInvalidOperation, wantMsg: "selected local planning"},
+		{name: "client default", directive: new("client")},
+		{name: "client explicit remote", directive: new("client"), opts: []ScanOption{WithScanPlanningMode(ScanPlanningRemote)}, wantErr: ErrInvalidOperation, wantMsg: "requires client-side scan planning"},
+		{name: "unrecognized directive", directive: new("bogus"), wantErr: iceberg.ErrInvalidArgument},
+		{name: "no directive auto", opts: []ScanOption{WithScanPlanningMode(ScanPlanningAuto)}},
+	}
+
+	for _, sc := range scans {
+		for _, tt := range tests {
+			t.Run(sc.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				txn, _ := createTestTransactionWithMemIO(t, *iceberg.UnpartitionedSpec)
+				tbl := txn.tbl
+				planner := &fakeScanPlanner{supports: true}
+				tbl.planner = planner
+				if tt.directive != nil {
+					WithScanPlanningDirective(*tt.directive, true)(tbl)
+				}
+
+				err := sc.plan(*tbl, tt.opts...)
+				assert.False(t, planner.called, "incremental scans never call the remote planner")
+				if tt.wantErr != nil {
+					require.ErrorIs(t, err, tt.wantErr)
+					assert.ErrorContains(t, err, tt.wantMsg)
+
+					return
+				}
+				require.NoError(t, err)
+			})
+		}
+	}
+}

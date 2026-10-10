@@ -1657,6 +1657,10 @@ func (scan *Scan) planFiles(ctx context.Context, projectScanColumns bool) ([]Fil
 			return scan.planFilesRemote(ctx)
 		}
 	case ScanPlanningLocal:
+	default:
+		// effectivePlanningMode validates the mode first; this keeps a mode it
+		// accepts but this switch does not handle from planning locally.
+		return nil, fmt.Errorf("%w: unknown scan planning mode %q", iceberg.ErrInvalidArgument, mode)
 	}
 
 	start := time.Now()

@@ -19,7 +19,9 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -63,10 +65,11 @@ func TestScanPlanningDirective(t *testing.T) {
 			logs.Reset()
 			r := &Catalog{props: tc.catalog}
 
-			got, present := r.scanPlanningDirective([]string{"db", "tbl"}, tc.server)
+			got, present := r.scanPlanningDirective(context.Background(), []string{"db", "tbl"}, tc.server)
 			assert.Equal(t, tc.want, got)
 			assert.Equal(t, tc.wantPresent, present)
 			if tc.wantWarn {
+				assert.Contains(t, logs.String(), "level=WARN")
 				assert.Contains(t, logs.String(), "scan-planning-mode mismatch")
 				assert.Contains(t, logs.String(), "table=db.tbl")
 			} else {
@@ -74,4 +77,25 @@ func TestScanPlanningDirective(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Refresh reloads the table, so a stable mismatch must not warn on every load.
+func TestScanPlanningDirectiveMismatchWarnsOncePerCatalog(t *testing.T) {
+	logs := captureSlog(t)
+
+	key := table.ScanPlanningModeKey
+	r := &Catalog{props: iceberg.Properties{key: "client"}}
+	for range 3 {
+		r.scanPlanningDirective(context.Background(), []string{"db", "tbl"}, iceberg.Properties{key: "server"})
+	}
+
+	out := logs.String()
+	assert.Equal(t, 1, strings.Count(out, "level=WARN"), out)
+	assert.Equal(t, 2, strings.Count(out, "level=DEBUG"), out)
+
+	// A separate catalog warns again.
+	logs.Reset()
+	other := &Catalog{props: iceberg.Properties{key: "client"}}
+	other.scanPlanningDirective(context.Background(), []string{"db", "tbl"}, iceberg.Properties{key: "server"})
+	assert.Contains(t, logs.String(), "level=WARN")
 }

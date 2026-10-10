@@ -4548,6 +4548,26 @@ func TestEndpointNegotiation(t *testing.T) {
 	assert.False(t, tablesHit)
 }
 
+// directiveTestMetadata is minimal table metadata for the scan-planning
+// directive tests.
+const directiveTestMetadata = `{
+	"format-version": 1,
+	"table-uuid": "b55d9dda-6561-423a-8bfc-787980ce421f",
+	"location": "s3://warehouse/database/table",
+	"last-updated-ms": 1646787054459,
+	"last-column-id": 2,
+	"schema": {"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"int"},{"id":2,"name":"data","required":false,"type":"string"}]},
+	"current-schema-id": 0,
+	"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"int"},{"id":2,"name":"data","required":false,"type":"string"}]}],
+	"partition-spec": [],
+	"default-spec-id": 0,
+	"partition-specs": [{"spec-id":0,"fields":[]}],
+	"last-partition-id": 999,
+	"default-sort-order-id": 0,
+	"sort-orders": [{"order-id":0,"fields":[]}],
+	"properties": {}
+}`
+
 // A server directive without the plan endpoint must not block loading or
 // metadata-only use of the table; only planning a scan fails (#2102).
 func TestLoadTableServerDirectiveWithoutPlanEndpoint(t *testing.T) {
@@ -4574,23 +4594,7 @@ func TestLoadTableServerDirectiveWithoutPlanEndpoint(t *testing.T) {
 	mux.HandleFunc("/v1/namespaces/fokko/tables/tbl", func(w http.ResponseWriter, _ *http.Request) {
 		_, err := w.Write([]byte(`{
 			"metadata-location": "s3://warehouse/database/table/metadata/00001.metadata.json",
-			"metadata": {
-				"format-version": 1,
-				"table-uuid": "b55d9dda-6561-423a-8bfc-787980ce421f",
-				"location": "s3://warehouse/database/table",
-				"last-updated-ms": 1646787054459,
-				"last-column-id": 2,
-				"schema": {"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"int"},{"id":2,"name":"data","required":false,"type":"string"}]},
-				"current-schema-id": 0,
-				"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"int"},{"id":2,"name":"data","required":false,"type":"string"}]}],
-				"partition-spec": [],
-				"default-spec-id": 0,
-				"partition-specs": [{"spec-id":0,"fields":[]}],
-				"last-partition-id": 999,
-				"default-sort-order-id": 0,
-				"sort-orders": [{"order-id":0,"fields":[]}],
-				"properties": {}
-			},
+			"metadata": ` + directiveTestMetadata + `,
 			"config": {"scan-planning-mode": "server"}
 		}`))
 		require.NoError(t, err)
@@ -4612,4 +4616,50 @@ func TestLoadTableServerDirectiveWithoutPlanEndpoint(t *testing.T) {
 	_, err = tbl.Scan().PlanFiles(context.Background())
 	require.ErrorIs(t, err, table.ErrInvalidOperation)
 	assert.ErrorContains(t, err, "requires server-side scan planning")
+}
+
+// A catalog commonly advertises scan-planning-mode through the /v1/config
+// defaults block rather than client options. Tables from both LoadTable and
+// UpdateTable, whose commit response carries no table config, must enforce it.
+func TestCatalogConfigScanPlanningDirective(t *testing.T) {
+	const metadataLoc = "s3://warehouse/database/table/metadata/00001.metadata.json"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"defaults":  map[string]any{"scan-planning-mode": "server"},
+			"overrides": map[string]any{},
+		}))
+	})
+	mux.HandleFunc("/v1/namespaces/fokko/tables/tbl", func(w http.ResponseWriter, req *http.Request) {
+		body := `{"metadata-location": "` + metadataLoc + `", "metadata": ` + directiveTestMetadata
+		if req.Method == http.MethodGet {
+			body += `, "config": {}`
+		}
+		_, err := w.Write([]byte(body + `}`))
+		require.NoError(t, err)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cat, err := rest.NewCatalog(context.Background(), "rest", srv.URL, rest.WithOAuthToken(TestToken))
+	require.NoError(t, err)
+	ident := catalog.ToIdentifier("fokko", "tbl")
+
+	loaded, err := cat.LoadTable(context.Background(), ident)
+	require.NoError(t, err)
+	updated, err := cat.UpdateTable(context.Background(), ident, nil, nil)
+	require.NoError(t, err)
+
+	for name, tbl := range map[string]*table.Table{"load": loaded, "update": updated} {
+		t.Run(name, func(t *testing.T) {
+			directive, err := tbl.ScanPlanningDirective()
+			require.NoError(t, err)
+			assert.Equal(t, table.ScanPlanningDirectiveServer, directive)
+
+			_, err = tbl.Scan().PlanFiles(context.Background())
+			require.ErrorIs(t, err, table.ErrInvalidOperation)
+			assert.ErrorContains(t, err, "requires server-side scan planning")
+		})
+	}
 }
