@@ -20,6 +20,7 @@ package azure
 import (
 	"context"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -297,9 +298,7 @@ func TestClearTokenShadowingCredentialsSelectsToken(t *testing.T) {
 			acct, ok := adlsauth.AccountFor(location)
 			require.True(t, ok)
 			props := map[string]string{icebergio.ADLSToken: token}
-			for k, v := range tt.props {
-				props[k] = v
-			}
+			maps.Copy(props, tt.props)
 			adlsauth.ClearTokenShadowingCredentials(props, acct)
 
 			parsed, err := url.Parse(location)
