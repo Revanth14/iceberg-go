@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/internal/adlsauth"
 	iceio "github.com/apache/iceberg-go/io"
 	"golang.org/x/sync/semaphore"
 )
@@ -80,13 +81,18 @@ var credentialExpiryKeys = []string{
 	keyExpirationTime,
 }
 
+// isCredentialExpiryKey reports whether key is one parseCredentialExpiry reads.
+func isCredentialExpiryKey(key string) bool {
+	return slices.Contains(credentialExpiryKeys, key) ||
+		key == keyAdlsSasExpiresAtMs ||
+		strings.HasPrefix(key, keyAdlsSasExpiresAtMs+".")
+}
+
 func parseCredentialExpiry(config iceberg.Properties) (time.Time, bool) {
 	var earliest time.Time
 	found := false
 	for key, value := range config {
-		if !slices.Contains(credentialExpiryKeys, key) &&
-			key != keyAdlsSasExpiresAtMs &&
-			!strings.HasPrefix(key, keyAdlsSasExpiresAtMs+".") {
+		if !isCredentialExpiryKey(key) {
 			continue
 		}
 
@@ -173,7 +179,7 @@ func (v *vendedCredentialRefresher) loadFS(ctx context.Context) (iceio.IO, error
 		}
 
 		config = maps.Clone(v.props)
-		mergeVendedCredentials(config, freshCreds)
+		mergeVendedCredentials(config, freshCreds, v.location)
 	}
 
 	// The IO is cached and shared by every later caller, so it must not
@@ -432,23 +438,46 @@ func (p *prefixScopedIO) propertiesForLocation(name string) iceberg.Properties {
 	props := make(iceberg.Properties, len(p.baseProps))
 	maps.Copy(props, p.baseProps)
 	if credentialIndex >= 0 {
-		mergeVendedCredentials(props, p.credentials[credentialIndex].Config)
+		credentialConfig := p.credentials[credentialIndex].Config
+		clearOverriddenCredentialProperties(props, credentialConfig)
+		mergeVendedCredentials(props, credentialConfig, name)
 	}
 
 	return props
 }
 
-// mergeVendedCredentials applies a matched storage credential over config,
-// first dropping any inherited property that the credential is meant to
-// replace. Every site that merges vended credentials must go through here:
-// merging with maps.Copy alone leaves stale higher-precedence credentials in
-// place, which then shadow the freshly vended ones.
-func mergeVendedCredentials(config, credentialConfig iceberg.Properties) {
-	if len(credentialConfig) == 0 {
-		return
+// mergeVendedCredentials layers vended storage credential properties over
+// config, the properties an IO for location is built from. Every site that
+// merges storage credentials goes through here.
+//
+// A nonempty adls.token is the one case that also removes properties. config is
+// always a copy built for one IO, and the Azure FileIO serves only location's
+// storage account, so the removals cannot reach another account's IO:
+//   - Credentials the Azure FileIO selects ahead of the token would shadow it and
+//     the read would 403; see adlsauth.ClearTokenShadowingCredentials.
+//   - Every inherited credential expiry is dropped, whatever credential or
+//     account it was for. The IO's renewal takes the earliest expiry in config,
+//     so any of them would set the token's lifetime in place of the expiry
+//     vended with the token, or the default TTL without one. A server that
+//     vends adls.token for a location outside Azure is misconfigured; its IO
+//     loses inherited expiries too.
+//
+// Unlike the S3 and GCS clearing in clearOverriddenCredentialProperties, which
+// keys on property presence, this keys on a nonempty value: the Azure FileIO
+// skips an empty adls.token, so clearing for one would discard working
+// credentials.
+func mergeVendedCredentials(config, credentialConfig iceberg.Properties, location string) {
+	if credentialConfig[iceio.ADLSToken] != "" {
+		if acct, ok := adlsauth.AccountFor(location); ok {
+			adlsauth.ClearTokenShadowingCredentials(config, acct)
+			for key := range config {
+				if isCredentialExpiryKey(key) {
+					delete(config, key)
+				}
+			}
+		}
 	}
 
-	clearOverriddenCredentialProperties(config, credentialConfig)
 	maps.Copy(config, credentialConfig)
 }
 
@@ -484,26 +513,6 @@ func clearOverriddenCredentialProperties(props, credentialConfig iceberg.Propert
 			suffix := strings.TrimPrefix(key, keyAdlsSasExpiresAtMs+".")
 			delete(props, iceio.ADLSSasTokenPrefix+suffix)
 			delete(props, keyAdlsSasExpiresAtMs+"."+suffix)
-		}
-	}
-
-	if credentialConfig[iceio.ADLSToken] != "" {
-		// adls.token is evaluated after shared-key, SAS-token, and connection-string
-		// auth, so any of those left over from the table or catalog configuration
-		// would shadow a freshly vended token and the read would 403. props is a
-		// per-location copy, so clearing them cannot affect another location's IO.
-		//
-		// The value must be nonempty: the Azure bucket factory skips an empty
-		// adls.token, so clearing on mere key presence would discard working
-		// credentials and fall through to a weaker auth method.
-		delete(props, iceio.ADLSSharedKeyAccountName)
-		delete(props, iceio.ADLSSharedKeyAccountKey)
-		for key := range props {
-			if strings.HasPrefix(key, iceio.ADLSSasTokenPrefix) ||
-				strings.HasPrefix(key, keyAdlsSasExpiresAtMs+".") ||
-				strings.HasPrefix(key, iceio.ADLSConnectionStringPrefix) {
-				delete(props, key)
-			}
 		}
 	}
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/apache/iceberg-go/internal/adlsauth"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/io/gocloud/blobfs"
 	"gocloud.dev/blob"
@@ -115,24 +116,22 @@ func newAdlsLocation(adlsURI *url.URL) (*adlsLocation, error) {
 		return nil, errors.New("container name is required for azure bucket")
 	}
 
-	hostname := adlsURI.Hostname()
-	if hostname == "" {
+	if adlsURI.Hostname() == "" {
 		return nil, errors.New("hostname is required for azure bucket")
 	}
 
-	// Extract account name from hostname (ignore the storage domain)
-	parts := strings.Split(hostname, ".")
-	if len(parts) == 0 || parts[0] == "" {
+	// The account name is the hostname's first label (ignore the storage domain).
+	acct, ok := adlsauth.AccountForURL(adlsURI)
+	if !ok {
 		return nil, errors.New("account name is required for azure bucket")
 	}
-	accountName := parts[0]
 
 	path := adlsURI.Path
 
 	return &adlsLocation{
-		accountName:   accountName,
+		accountName:   acct.Name,
 		containerName: containerName,
-		hostname:      hostname,
+		hostname:      acct.Host,
 		path:          path,
 	}, nil
 }

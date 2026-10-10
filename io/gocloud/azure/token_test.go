@@ -31,6 +31,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/apache/iceberg-go/internal/adlsauth"
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -230,6 +231,117 @@ func TestAzureTokenAuthentication(t *testing.T) {
 			}
 			assert.Equal(t, tt.wantDefault, defaultCalled)
 			assert.Equal(t, tt.wantManaged, managedCalled)
+		})
+	}
+}
+
+// TestClearTokenShadowingCredentialsSelectsToken pins adlsauth, which the REST
+// catalog uses to keep a vended adls.token from being shadowed, to this
+// package's precedence order: once it has cleared a location's account, the
+// factory must authenticate with the token. If the factory gains or reorders an
+// auth method ahead of the token, this fails instead of the token silently
+// losing to a stale credential.
+func TestClearTokenShadowingCredentialsSelectsToken(t *testing.T) {
+	const (
+		token    = "opaque-access-token"
+		location = "abfss://container@testaccount.dfs.core.windows.net/path"
+	)
+	const wantAuth = "Bearer " + token
+	tests := []struct {
+		name  string
+		props map[string]string
+	}{
+		{
+			name: "shared key for the account",
+			props: map[string]string{
+				icebergio.ADLSSharedKeyAccountName: "testaccount",
+				icebergio.ADLSSharedKeyAccountKey:  "YQ==",
+			},
+		},
+		{
+			name: "SAS for the account",
+			props: map[string]string{
+				icebergio.ADLSSasTokenPrefix + "testaccount.dfs.core.windows.net": "sig=sas-signature",
+			},
+		},
+		{
+			name: "connection string for the account",
+			props: map[string]string{
+				icebergio.ADLSConnectionStringPrefix + "testaccount": "DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=YQ==;EndpointSuffix=core.windows.net",
+			},
+		},
+		{
+			name: "every method for the account, plus another account's",
+			props: map[string]string{
+				icebergio.ADLSSharedKeyAccountName:                                "testaccount",
+				icebergio.ADLSSharedKeyAccountKey:                                 "YQ==",
+				icebergio.ADLSSasTokenPrefix + "testaccount.dfs.core.windows.net": "sig=sas-signature",
+				icebergio.ADLSConnectionStringPrefix + "testaccount":              "invalid-connection-string",
+				icebergio.ADLSSasTokenPrefix + "other.dfs.core.windows.net":       "sig=other",
+				icebergio.ADLSConnectionStringPrefix + "other":                    "invalid-connection-string",
+			},
+		},
+		{
+			// The factory applies a shared key to every account, so one naming
+			// another account would otherwise sign this account's requests.
+			name: "shared key for another account",
+			props: map[string]string{
+				icebergio.ADLSSharedKeyAccountName: "otheraccount",
+				icebergio.ADLSSharedKeyAccountKey:  "YQ==",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			acct, ok := adlsauth.AccountFor(location)
+			require.True(t, ok)
+			props := map[string]string{icebergio.ADLSToken: token}
+			for k, v := range tt.props {
+				props[k] = v
+			}
+			adlsauth.ClearTokenShadowingCredentials(props, acct)
+
+			parsed, err := url.Parse(location)
+			require.NoError(t, err)
+			factories := azureCredentialFactories{
+				newDefaultCredential: func(*azidentity.DefaultAzureCredentialOptions) (azcore.TokenCredential, error) {
+					t.Error("default credential chain must not be selected")
+
+					return &fake.TokenCredential{}, nil
+				},
+				newManagedIdentity: func(*azidentity.ManagedIdentityCredentialOptions) (azcore.TokenCredential, error) {
+					t.Error("managed identity must not be selected")
+
+					return &fake.TokenCredential{}, nil
+				},
+			}
+			requests := 0
+			options := &container.ClientOptions{ClientOptions: azcore.ClientOptions{
+				Retry: policy.RetryOptions{MaxRetries: -1},
+				Transport: tokenTestTransport(func(req *http.Request) (*http.Response, error) {
+					requests++
+					assert.Equal(t, wantAuth, req.Header.Get("Authorization"))
+					assert.Empty(t, req.URL.Query().Get("sig"))
+					header := http.Header{}
+					header.Set("Last-Modified", "Mon, 21 Sep 2026 00:00:00 GMT")
+					header.Set("x-ms-creation-time", "Mon, 21 Sep 2026 00:00:00 GMT")
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     header,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Request:    req,
+					}, nil
+				}),
+			}}
+
+			bucket, err := createAzureBucketWithOptions(t.Context(), parsed, props, factories, options)
+			require.NoError(t, err)
+			defer bucket.Close()
+			_, err = bucket.Exists(t.Context(), "file.parquet")
+			require.NoError(t, err)
+			assert.Equal(t, 1, requests)
 		})
 	}
 }
